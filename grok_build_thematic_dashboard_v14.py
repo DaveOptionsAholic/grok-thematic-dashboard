@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Grok Build v15 (deployed via v14 entrypoint for Streamlit Cloud)
-Chart options, sidebar controls & configurable visual analytics
+Grok Build v15 - Chart options, sidebar controls & configurable visual analytics
 """
 
 import streamlit as st
@@ -12,13 +11,16 @@ import plotly.express as px
 from datetime import datetime
 import random
 
+DASHBOARD_VERSION = "15.2"
+
 st.set_page_config(
-    page_title="Grok Build - Thematic Dashboard",
+    page_title="Grok Build v15 - Thematic Dashboard",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
 st.title("7 Thematic Portfolios")
+st.caption(f"Build **v{DASHBOARD_VERSION}** · Sidebar chart controls · GitHub `DaveOptionsAholic/grok-thematic-dashboard`")
 
 # ============================================================
 # CHART CONFIG
@@ -319,6 +321,7 @@ def render_sidebar_controls(perf_df, last_updated):
     """Render all dashboard & chart controls in the sidebar."""
     opts = {}
     with st.sidebar:
+        st.success(f"✅ Dashboard v{DASHBOARD_VERSION}")
         st.header("⚙️ Controls")
         if st.button("🔄 Refresh All Stock Data", type="primary", use_container_width=True):
             st.cache_data.clear()
@@ -649,4 +652,4 @@ with tab5:
             else:
                 st.info("ETF data temporarily unavailable.")
 
-st.caption("Grok Build • Sidebar controls • 7 Thematic Portfolios")
+st.caption(f"Grok Build v{DASHBOARD_VERSION} • Sidebar controls • 7 Thematic Portfolios")
