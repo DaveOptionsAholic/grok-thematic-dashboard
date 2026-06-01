@@ -14,8 +14,12 @@ if (-not $gh) {
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
 }
 
-gh auth status 2>$null
-if ($LASTEXITCODE -ne 0) {
+$prevEAP = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+gh auth status *> $null
+$authed = ($LASTEXITCODE -eq 0)
+$ErrorActionPreference = $prevEAP
+if (-not $authed) {
     Write-Host "Log in to GitHub (browser will open)..."
     gh auth login -h github.com -p https -w
 }
