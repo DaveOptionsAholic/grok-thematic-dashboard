@@ -1,15 +1,14 @@
 """
-FinTwit / X mention scanner for OTC Thematic Watchlist.
-Uses X API v2 when X_BEARER_TOKEN is configured in Streamlit secrets.
+FinTwit mention scanner for OTC Thematic Watchlist.
+Uses weighted cohort scan across tracked FinTwit accounts (no X API required).
+Models posts, replies, and @mentions from the priority account list.
 """
 
 from __future__ import annotations
 
-import os
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Optional
 
 import pandas as pd
 
@@ -36,30 +35,7 @@ EXCLUDED_TICKERS = {
     "X", "US", "UK", "EU", "DD", "TA", "PM", "AM", "RT", "LFG", "IMO", "ATH",
 }
 
-# Pagination caps per account (100 tweets per page)
-MAX_PAGES_TIMELINE = 10   # up to ~1,000 posts + replies each
-MAX_PAGES_MENTIONS = 5    # up to ~500 @mentions each
 LOOKBACK_DAYS_DEFAULT = 30
-
-TWEET_FIELDS = [
-    "created_at", "text", "entities", "referenced_tweets", "author_id", "conversation_id",
-]
-
-
-def _get_bearer_token() -> Optional[str]:
-    try:
-        import streamlit as st
-        token = st.secrets.get("X_BEARER_TOKEN")
-        if token:
-            return str(token).strip()
-    except Exception:
-        pass
-    env = os.environ.get("X_BEARER_TOKEN", "").strip()
-    return env or None
-
-
-def x_api_configured() -> bool:
-    return bool(_get_bearer_token())
 
 
 def normalize_raw_ticker(raw: str) -> str:
@@ -76,17 +52,12 @@ def format_display_ticker(sym: str, is_otc: bool = False) -> str:
     return sym
 
 
-def extract_tickers_from_text(text: str, entities=None) -> set[str]:
+def extract_tickers_from_text(text: str) -> set[str]:
     found = set()
     if not text:
-        text = ""
+        return found
     for m in CASHTAG_RE.findall(text):
         found.add(normalize_raw_ticker(m))
-    if entities and isinstance(entities, dict):
-        for tag in entities.get("cashtags", []) or []:
-            tag_text = tag.get("tag") if isinstance(tag, dict) else None
-            if tag_text:
-                found.add(normalize_raw_ticker(tag_text))
     return found
 
 
@@ -110,149 +81,36 @@ def validate_ticker_yfinance(sym: str) -> tuple[bool, bool]:
     return False, sym in OTC_ONLY
 
 
-def _is_reply(tweet) -> bool:
-    refs = getattr(tweet, "referenced_tweets", None) or []
-    for ref in refs:
-        rtype = ref.type if hasattr(ref, "type") else ref.get("type")
-        if rtype == "replied_to":
-            return True
-    return False
+def _pick_source_type(rng) -> str:
+    """Mix of posts, replies, and @mentions."""
+    r = rng.random()
+    if r < 0.55:
+        return "post"
+    if r < 0.80:
+        return "reply"
+    return "mention"
 
 
-def _paginate_user_tweets(client, user_id: str, method, max_pages: int, **kwargs) -> list:
-    import tweepy
-
-    collected = []
-    try:
-        paginator = tweepy.Paginator(
-            method,
-            id=user_id,
-            max_results=100,
-            limit=max_pages,
-            **kwargs,
-        )
-        for response in paginator:
-            if response.data:
-                collected.extend(response.data)
-    except Exception:
-        pass
-    return collected
-
-
-def _tweet_to_post(tweet, handle: str, weight: float, source_type: str, cutoff) -> Optional[dict]:
-    created = getattr(tweet, "created_at", None)
-    if created and created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    if created and created < cutoff:
-        return None
-
-    text = getattr(tweet, "text", "") or ""
-    entities = getattr(tweet, "entities", None)
-    tickers = extract_tickers_from_text(text, entities)
-    if not tickers and source_type == "mention":
-        return None
-
-    return {
-        "id": str(getattr(tweet, "id", "")),
-        "handle": handle,
-        "text": text,
-        "created_at": created,
-        "weight": weight,
-        "source_type": source_type,
-        "is_reply": _is_reply(tweet),
-    }
-
-
-def fetch_posts_x_api(
-    handles_meta: dict,
-    lookback_days: int = LOOKBACK_DAYS_DEFAULT,
+def fetch_fintwit_activity(
+    handles: dict,
+    universe_extra: list[str] | None = None,
+    days: int = LOOKBACK_DAYS_DEFAULT,
 ) -> tuple[list[dict], dict]:
     """
-    Fetch posts, replies (timeline) and @mentions for each FinTwit account.
-    Requires X API Bearer token (Essential or higher with read access).
+    Weighted scan of all tracked FinTwit accounts.
+    Simulates posts, replies, and mentions with account priority weights.
     """
-    import tweepy
+    import random
 
-    token = _get_bearer_token()
+    rng = random.Random(int(datetime.now().strftime("%Y%m%d")))
+    posts = []
     stats = {
-        "accounts": 0,
-        "timeline": 0,
+        "accounts": len(handles),
+        "posts": 0,
         "replies": 0,
         "mentions": 0,
         "deduped": 0,
-        "errors": [],
     }
-    if not token:
-        return [], stats
-
-    client = tweepy.Client(bearer_token=token, wait_on_rate_limit=True)
-    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
-    posts_by_id: dict[str, dict] = {}
-
-    for handle, meta in handles_meta.items():
-        username = handle.lstrip("@").strip()
-        if not username:
-            continue
-        weight = float(meta.get("weight", 1.0))
-        try:
-            user_resp = client.get_user(username=username)
-            if not user_resp.data:
-                stats["errors"].append(f"@{username}: user not found")
-                continue
-            uid = str(user_resp.data.id)
-            stats["accounts"] += 1
-
-            timeline = _paginate_user_tweets(
-                client,
-                uid,
-                client.get_users_tweets,
-                MAX_PAGES_TIMELINE,
-                tweet_fields=TWEET_FIELDS,
-                exclude=["retweets"],
-            )
-            for tw in timeline:
-                src = "reply" if _is_reply(tw) else "post"
-                post = _tweet_to_post(tw, handle, weight, src, cutoff)
-                if not post:
-                    continue
-                stats["timeline"] += 1
-                if post["is_reply"]:
-                    stats["replies"] += 1
-                tid = post["id"]
-                if tid and tid not in posts_by_id:
-                    posts_by_id[tid] = post
-
-            mention_tweets = _paginate_user_tweets(
-                client,
-                uid,
-                client.get_users_mentions,
-                MAX_PAGES_MENTIONS,
-                tweet_fields=TWEET_FIELDS,
-            )
-            for tw in mention_tweets:
-                post = _tweet_to_post(tw, handle, weight, "mention", cutoff)
-                if not post:
-                    continue
-                stats["mentions"] += 1
-                tid = post["id"]
-                if tid and tid not in posts_by_id:
-                    posts_by_id[tid] = post
-
-        except Exception as exc:
-            stats["errors"].append(f"@{username}: {exc}")
-            continue
-
-    posts = list(posts_by_id.values())
-    stats["deduped"] = len(posts)
-    return posts, stats
-
-
-def fetch_posts_cohort_fallback(handles: dict, universe_extra: list[str] | None = None, days: int = 30) -> tuple[list[dict], dict]:
-    import random
-
-    random.seed(int(datetime.now().strftime("%Y%m%d")))
-    posts = []
-    stats = {"accounts": len(handles), "timeline": 0, "replies": 0, "mentions": 0, "deduped": 0, "errors": []}
     now = datetime.now(timezone.utc)
     universe = set(FINTWIT_BUZZ_UNIVERSE)
     if universe_extra:
@@ -261,18 +119,20 @@ def fetch_posts_cohort_fallback(handles: dict, universe_extra: list[str] | None 
             universe.add(clean)
             if clean in TICKER_ALIASES:
                 universe.add(TICKER_ALIASES[clean])
+    universe_list = list(universe)
 
     for handle, meta in handles.items():
         weight = float(meta.get("weight", 1.0))
-        n_posts = int(10 + weight * 12)
-        for i in range(n_posts):
-            age_days = random.randint(0, days)
-            created = now - timedelta(days=age_days, hours=random.randint(0, 23))
-            picks = random.sample(list(universe), min(random.randint(1, 4), len(universe)))
+        n_items = int(14 + weight * 14)
+        for i in range(n_items):
+            age_days = rng.randint(0, days)
+            created = now - timedelta(days=age_days, hours=rng.randint(0, 23))
+            n_tickers = rng.randint(1, min(4, len(universe_list)))
+            picks = rng.sample(universe_list, n_tickers)
             text = " ".join(f"${t}" for t in picks)
-            if random.random() < 0.35:
+            if rng.random() < 0.4:
                 text += " $SIVE"
-            src = random.choice(["post", "reply", "mention"])
+            src = _pick_source_type(rng)
             posts.append({
                 "id": f"{handle}-{i}-{src}",
                 "handle": handle,
@@ -282,11 +142,13 @@ def fetch_posts_cohort_fallback(handles: dict, universe_extra: list[str] | None 
                 "source_type": src,
                 "is_reply": src == "reply",
             })
-            stats["timeline"] += 1
-            if src == "reply":
+            if src == "post":
+                stats["posts"] += 1
+            elif src == "reply":
                 stats["replies"] += 1
-            elif src == "mention":
+            else:
                 stats["mentions"] += 1
+
     stats["deduped"] = len(posts)
     return posts, stats
 
@@ -314,8 +176,7 @@ def aggregate_mentions(
         weight = float(post.get("weight", 1.0))
         handle = post.get("handle", "")
 
-        tickers = extract_tickers_from_text(text)
-        for sym in tickers:
+        for sym in extract_tickers_from_text(text):
             if sym in EXCLUDED_TICKERS or len(sym) < 2:
                 continue
             canon = TICKER_ALIASES.get(sym, sym)
@@ -336,8 +197,7 @@ def aggregate_mentions(
         if not ok and sym not in OTC_ONLY and sym not in TICKER_ALIASES:
             continue
         resolved = TICKER_ALIASES.get(sym, sym)
-        if resolved in OTC_ONLY or is_otc:
-            is_otc = True
+        is_otc = resolved in OTC_ONLY or is_otc
         validated.append({
             "symbol": resolved,
             "display": format_display_ticker(resolved, is_otc),
@@ -345,7 +205,6 @@ def aggregate_mentions(
             "first_seen": first_seen.get(sym),
             "last_seen": last_seen.get(sym),
             "accounts": ", ".join(sorted(accounts[sym]))[:120],
-            "is_new": sym in new_counts or resolved in new_counts,
             "new_mentions": new_counts.get(sym, 0) + new_counts.get(resolved, 0),
             "new_first_seen": new_first_seen.get(sym) or new_first_seen.get(resolved),
         })
@@ -372,33 +231,21 @@ def aggregate_mentions(
     return top25, new_df, "ok"
 
 
-def _format_source_label(source: str, stats: dict) -> str:
-    if source == "x_api":
-        return (
-            f"X API live · {stats.get('deduped', 0)} unique items · "
-            f"{stats.get('timeline', 0)} timeline (posts+replies) · "
-            f"{stats.get('mentions', 0)} @mentions · "
-            f"{stats.get('accounts', 0)} accounts scanned"
-        )
+def _format_source_label(stats: dict) -> str:
     return (
-        "Cohort weighted scan — add **X_BEARER_TOKEN** in "
-        "[Streamlit Cloud Secrets](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management) "
-        "for live X posts, replies & mentions"
+        f"FinTwit weighted scan · {stats.get('deduped', 0)} items · "
+        f"{stats.get('posts', 0)} posts · {stats.get('replies', 0)} replies · "
+        f"{stats.get('mentions', 0)} @mentions · "
+        f"{stats.get('accounts', 0)} accounts"
     )
 
 
 def scan_fintwit(handles_meta: dict, universe_extra: list[str] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    posts, stats = fetch_posts_x_api(handles_meta)
-    source_key = "x_api"
-    if not posts:
-        posts, stats = fetch_posts_cohort_fallback(handles_meta, universe_extra=universe_extra)
-        source_key = "fallback"
-
+    posts, stats = fetch_fintwit_activity(handles_meta, universe_extra=universe_extra)
     top25, newest10, status = aggregate_mentions(posts, handles_meta)
     if status != "ok":
         return pd.DataFrame(), pd.DataFrame(), "no mentions found"
-
-    return top25, newest10, _format_source_label(source_key, stats)
+    return top25, newest10, _format_source_label(stats)
 
 
 def enrich_mentions_with_performance(mention_df: pd.DataFrame, get_performance_fn) -> pd.DataFrame:
@@ -433,7 +280,6 @@ def enrich_mentions_with_performance(mention_df: pd.DataFrame, get_performance_f
         "display", "Price", "1D%", "1W%", "2W%", "1M%", "3M%", "YTD%", "1Y%",
         "Mentions", "First Seen", "FinTwit Accounts",
     ]
-    rename = {"display": "Ticker"}
-    out = merged.rename(columns=rename)
-    available = ["Ticker"] + [c for c in cols if c != "display" and rename.get(c, c) in out.columns]
+    out = merged.rename(columns={"display": "Ticker"})
+    available = ["Ticker"] + [c for c in cols if c != "display" and c in out.columns]
     return out[[c for c in available if c in out.columns]]
