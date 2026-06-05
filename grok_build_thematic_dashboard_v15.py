@@ -471,6 +471,87 @@ def build_etf_chart(etf_df, metric, chart_type, top_n, template, color_scale):
     )
     return apply_chart_style(fig, template, 480)
 
+def build_otc_top25_line_polar(df, template="plotly_dark"):
+    """Line polar plot for Top 25 FinTwit mentions."""
+    if df.empty or "Mentions" not in df.columns:
+        return None
+    plot_df = df.nlargest(25, "Mentions").copy()
+    plot_df["theta"] = plot_df["Ticker"].str.replace(" (OTC)", "", regex=False)
+    plot_df["r"] = plot_df["Mentions"].astype(float)
+    r_max = max(plot_df["r"].max(), 1.0)
+    plot_df["strength"] = plot_df["r"].apply(
+        lambda v: "High" if v >= r_max * 0.66 else ("Mid" if v >= r_max * 0.33 else "Low")
+    )
+    fig = px.line_polar(
+        plot_df.sort_values("r"),
+        r="r",
+        theta="theta",
+        color="strength",
+        line_close=True,
+        color_discrete_sequence=px.colors.sequential.Plasma_r,
+        template=template,
+        title="Top 25 FinTwit Mentions — Line Polar",
+    )
+    fig.update_layout(
+        height=520,
+        polar=dict(radialaxis=dict(showticklabels=True, ticksuffix="")),
+    )
+    return fig
+
+def build_otc_newest10_dot_plot(df, template="plotly_dark"):
+    """Styled categorical dot plot for newest FinTwit mentions."""
+    if df.empty or "Mentions" not in df.columns:
+        return None
+    plot_df = df.head(10).sort_values("Mentions", ascending=True).copy()
+    tickers = plot_df["Ticker"].tolist()
+    mentions = plot_df["Mentions"].astype(float).tolist()
+    one_w = plot_df["1W%"].fillna(0).astype(float).tolist() if "1W%" in plot_df.columns else [0.0] * len(plot_df)
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=mentions,
+        y=tickers,
+        name="FinTwit Mentions",
+        marker=dict(
+            color="rgba(99, 110, 250, 0.95)",
+            line_color="rgba(99, 110, 250, 1.0)",
+        ),
+    ))
+    fig.add_trace(go.Scatter(
+        x=one_w,
+        y=tickers,
+        name="1 Week Return %",
+        marker=dict(
+            color="rgba(204, 204, 204, 0.95)",
+            line_color="rgba(217, 217, 217, 1.0)",
+        ),
+    ))
+    fig.update_traces(mode="markers", marker=dict(line_width=1, symbol="circle", size=16))
+    bg = "#0E1117" if "dark" in template else "white"
+    fg = "#FAFAFA" if "dark" in template else "rgb(102, 102, 102)"
+    fig.update_layout(
+        title=dict(text="10 Newest FinTwit Mentions — Mentions vs 1 Week Return %"),
+        template=template,
+        xaxis=dict(
+            showgrid=False,
+            showline=True,
+            linecolor=fg,
+            tickfont_color=fg,
+            showticklabels=True,
+            ticks="outside",
+            tickcolor=fg,
+            title="Value",
+        ),
+        yaxis=dict(tickfont_color=fg),
+        margin=dict(l=140, r=40, b=50, t=80),
+        legend=dict(font_size=10, yanchor="middle", xanchor="right"),
+        height=480,
+        paper_bgcolor=bg,
+        plot_bgcolor=bg,
+        hovermode="closest",
+    )
+    return fig
+
 # ============================================================
 # LOAD DATA
 # ============================================================
@@ -594,8 +675,13 @@ with tab2:
 
     st.markdown("### 1. Top 25 Mentions")
     st.caption("All posts/mentions from tracked FinTwit accounts · ranked by mention count")
+    otc_chart_template = sidebar.get("chart_template", "plotly_dark")
+
     if not top25_otc.empty:
         show_table(top25_otc, sort_by='Mentions', ascending=False)
+        fig_top25_polar = build_otc_top25_line_polar(top25_otc, otc_chart_template)
+        if fig_top25_polar:
+            st.plotly_chart(fig_top25_polar, width='stretch')
     else:
         st.info("No mentions found. Click **Scan FinTwit Mentions** to refresh.")
 
@@ -604,6 +690,9 @@ with tab2:
     st.caption("Stocks first mentioned in the **last 7 days** across tracked FinTwit accounts")
     if not newest10_otc.empty:
         show_table(newest10_otc, sort_by='Mentions', ascending=False)
+        fig_newest_dot = build_otc_newest10_dot_plot(newest10_otc, otc_chart_template)
+        if fig_newest_dot:
+            st.plotly_chart(fig_newest_dot, width='stretch')
     else:
         st.info("No new mentions in the last 7 days.")
 
