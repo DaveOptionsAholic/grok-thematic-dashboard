@@ -9,7 +9,10 @@ import yfinance as yf
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
+import json
 import random
+
+from fintwit_mentions import enrich_mentions_with_performance, scan_fintwit
 
 DASHBOARD_VERSION = "15.2"
 
@@ -155,6 +158,9 @@ def show_table(df, sort_by=None, ascending=False):
 
     desired_cols = ['Ticker', 'Price', '1 Day %', '1 Week Return %', '2 Week Return %',
                     '1 Month %', '3 Month %', 'YTD %', '1 Year %', 'Mentions', 'Weighted Score']
+    for extra in ('First Seen', 'FinTwit Accounts'):
+        if extra in display_df.columns:
+            desired_cols.append(extra)
     available_cols = [col for col in desired_cols if col in display_df.columns]
     display_df = display_df[available_cols]
 
@@ -179,8 +185,19 @@ def show_table(df, sort_by=None, ascending=False):
             "1 Year %": st.column_config.NumberColumn(format="%.2f%%", width=90),
             "Mentions": st.column_config.NumberColumn(format="%d", width=85),
             "Weighted Score": st.column_config.NumberColumn(format="%.1f", width=110),
+            "First Seen": st.column_config.TextColumn(width=100),
+            "FinTwit Accounts": st.column_config.TextColumn(width=200),
         }
     )
+
+@st.cache_data(ttl=600)
+def run_fintwit_otc_scan(handles_blob: str, tickers_blob: str):
+    handles = json.loads(handles_blob)
+    tickers = json.loads(tickers_blob)
+    top25, newest10, source = scan_fintwit(handles, tickers)
+    top25_enriched = enrich_mentions_with_performance(top25, get_performance)
+    newest10_enriched = enrich_mentions_with_performance(newest10, get_performance)
+    return top25_enriched, newest10_enriched, source
 
 def filter_chart_data(df, theme_filter, exclude_etfs=True):
     if df.empty:
@@ -553,18 +570,42 @@ with tab1:
         st.info("ETF data temporarily unavailable.")
 
 with tab2:
-    st.subheader("🟠 OTC Thematic Watchlist")
+    st.subheader("🟠 OTC Thematic Watchlist — FinTwit Mentions")
     st.caption(f"Last updated: {last_updated}")
-    st.caption("OTC stocks (failed tickers automatically skipped)")
-    otc_tickers = [t for t in all_tickers if "(OTC)" in t]
-    if otc_tickers:
-        otc_perf = get_performance(otc_tickers)
-        if not otc_perf.empty:
-            show_table(otc_perf, sort_by='1W%', ascending=False)
-        else:
-            st.info("No OTC data available right now.")
+    st.caption(
+        "Scans all priority FinTwit accounts on X for cashtags ($TICKER). "
+        "OTC aliases resolved (e.g. **$SIVE → $SIVEF**). US + OTC markets."
+    )
+
+    scan_col1, scan_col2 = st.columns([3, 1])
+    with scan_col1:
+        if "otc_scan_source" in st.session_state:
+            st.caption(f"**Data source:** {st.session_state.otc_scan_source}")
+    with scan_col2:
+        if st.button("🔄 Scan FinTwit Mentions", type="primary", key="otc_fintwit_scan"):
+            run_fintwit_otc_scan.clear()
+            st.session_state.otc_scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            st.rerun()
+
+    handles_blob = json.dumps(FINTWIT_ACCOUNTS)
+    tickers_blob = json.dumps(all_tickers)
+    top25_otc, newest10_otc, scan_source = run_fintwit_otc_scan(handles_blob, tickers_blob)
+    st.session_state.otc_scan_source = scan_source
+
+    st.markdown("### 1. Top 25 Mentions")
+    st.caption("All posts/mentions from tracked FinTwit accounts · ranked by mention count")
+    if not top25_otc.empty:
+        show_table(top25_otc, sort_by='Mentions', ascending=False)
     else:
-        st.info("No OTC tickers configured.")
+        st.info("No mentions found. Click **Scan FinTwit Mentions** to refresh.")
+
+    st.markdown("---")
+    st.markdown("### 2. 10 Newest Mentions")
+    st.caption("Stocks first mentioned in the **last 7 days** across tracked FinTwit accounts")
+    if not newest10_otc.empty:
+        show_table(newest10_otc, sort_by='Mentions', ascending=False)
+    else:
+        st.info("No new mentions in the last 7 days.")
 
 with tab3:
     st.subheader("FinTwit Accounts — Priority Cohort")
