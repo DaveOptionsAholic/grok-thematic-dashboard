@@ -471,31 +471,37 @@ def build_etf_chart(etf_df, metric, chart_type, top_n, template, color_scale):
     )
     return apply_chart_style(fig, template, 480)
 
-def build_otc_top25_line_polar(df, template="plotly_dark"):
-    """Line polar plot for Top 25 FinTwit mentions."""
+def build_otc_top25_treemap(df, template="plotly_dark", color_scale="RdYlGn"):
+    """Treemap for Top 25 FinTwit mentions (size = mentions, color = 1W% return)."""
     if df.empty or "Mentions" not in df.columns:
         return None
     plot_df = df.nlargest(25, "Mentions").copy()
-    plot_df["theta"] = plot_df["Ticker"].str.replace(" (OTC)", "", regex=False)
-    plot_df["r"] = plot_df["Mentions"].astype(float)
-    r_max = max(plot_df["r"].max(), 1.0)
-    plot_df["strength"] = plot_df["r"].apply(
-        lambda v: "High" if v >= r_max * 0.66 else ("Mid" if v >= r_max * 0.33 else "Low")
+    plot_df["label"] = plot_df["Ticker"]
+    plot_df["parent"] = "FinTwit Top 25"
+    plot_df["Mentions"] = plot_df["Mentions"].astype(float)
+    color_col = "1W%" if "1W%" in plot_df.columns and plot_df["1W%"].notna().any() else "Mentions"
+    treemap_kwargs = {
+        "names": "label",
+        "parents": "parent",
+        "values": "Mentions",
+        "color": color_col,
+        "color_continuous_scale": color_scale,
+        "template": template,
+        "title": "Top 25 FinTwit Mentions — Treemap",
+    }
+    if color_col == "1W%":
+        treemap_kwargs["color_continuous_midpoint"] = 0
+    fig = px.treemap(plot_df, **treemap_kwargs)
+    fig.update_traces(
+        textinfo="label+value+percent entry",
+        textfont_size=13,
+        hovertemplate=(
+            "<b>%{label}</b><br>"
+            "Mentions: %{value}<br>"
+            f"{color_col}: %{{color:.2f}}<extra></extra>"
+        ),
     )
-    fig = px.line_polar(
-        plot_df.sort_values("r"),
-        r="r",
-        theta="theta",
-        color="strength",
-        line_close=True,
-        color_discrete_sequence=px.colors.sequential.Plasma_r,
-        template=template,
-        title="Top 25 FinTwit Mentions — Line Polar",
-    )
-    fig.update_layout(
-        height=520,
-        polar=dict(radialaxis=dict(showticklabels=True, ticksuffix="")),
-    )
+    fig.update_layout(height=520, margin=dict(t=50, l=8, r=8, b=8))
     return fig
 
 def build_otc_newest10_dot_plot(df, template="plotly_dark"):
@@ -679,9 +685,11 @@ with tab2:
 
     if not top25_otc.empty:
         show_table(top25_otc, sort_by='Mentions', ascending=False)
-        fig_top25_polar = build_otc_top25_line_polar(top25_otc, otc_chart_template)
-        if fig_top25_polar:
-            st.plotly_chart(fig_top25_polar, width='stretch')
+        fig_top25_tree = build_otc_top25_treemap(
+            top25_otc, otc_chart_template, sidebar.get("color_scale", "RdYlGn")
+        )
+        if fig_top25_tree:
+            st.plotly_chart(fig_top25_tree, width='stretch')
     else:
         st.info("No mentions found. Click **Scan FinTwit Mentions** to refresh.")
 
