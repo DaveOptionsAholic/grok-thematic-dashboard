@@ -1,6 +1,6 @@
 """
 FinTwit / X mention scanner for OTC Thematic Watchlist.
-Uses X API v2 when bearer token is configured; otherwise cohort-weighted scan.
+Uses X API v2 when X_BEARER_TOKEN is configured in Streamlit secrets.
 """
 
 from __future__ import annotations
@@ -13,18 +13,15 @@ from typing import Optional
 
 import pandas as pd
 
-# Maps exchange-listed symbols to US/OTC tickers used on FinTwit
 TICKER_ALIASES = {
     "SIVE": "SIVEF",
     "SIEV": "SIVEF",
 }
 
-# Known OTC-only symbols (display with suffix)
 OTC_ONLY = {
     "SIVEF": "Sivers Semiconductors",
 }
 
-# Symbols FinTwit often discusses beyond theme lists
 FINTWIT_BUZZ_UNIVERSE = [
     "NVDA", "ASTS", "RKLB", "IONQ", "MU", "LITE", "COHR", "SIVEF", "SIVE",
     "TSLA", "AMD", "SMCI", "PLTR", "MSTR", "COIN", "QBTS", "RGTI", "LUNR",
@@ -32,7 +29,6 @@ FINTWIT_BUZZ_UNIVERSE = [
 ]
 
 CASHTAG_RE = re.compile(r"\$([A-Za-z]{1,5}(?:\.[A-Za-z]{1,2})?)\b")
-TICKER_RE = re.compile(r"\b([A-Z]{1,5})\b")
 
 EXCLUDED_TICKERS = {
     "A", "I", "AI", "IT", "ON", "ALL", "ARE", "FOR", "THE", "AND", "OR", "NOT",
@@ -40,15 +36,30 @@ EXCLUDED_TICKERS = {
     "X", "US", "UK", "EU", "DD", "TA", "PM", "AM", "RT", "LFG", "IMO", "ATH",
 }
 
+# Pagination caps per account (100 tweets per page)
+MAX_PAGES_TIMELINE = 10   # up to ~1,000 posts + replies each
+MAX_PAGES_MENTIONS = 5    # up to ~500 @mentions each
+LOOKBACK_DAYS_DEFAULT = 30
+
+TWEET_FIELDS = [
+    "created_at", "text", "entities", "referenced_tweets", "author_id", "conversation_id",
+]
+
 
 def _get_bearer_token() -> Optional[str]:
     try:
         import streamlit as st
-        if hasattr(st, "secrets") and st.secrets.get("X_BEARER_TOKEN"):
-            return str(st.secrets["X_BEARER_TOKEN"]).strip()
+        token = st.secrets.get("X_BEARER_TOKEN")
+        if token:
+            return str(token).strip()
     except Exception:
         pass
-    return os.environ.get("X_BEARER_TOKEN", "").strip() or None
+    env = os.environ.get("X_BEARER_TOKEN", "").strip()
+    return env or None
+
+
+def x_api_configured() -> bool:
+    return bool(_get_bearer_token())
 
 
 def normalize_raw_ticker(raw: str) -> str:
@@ -65,92 +76,183 @@ def format_display_ticker(sym: str, is_otc: bool = False) -> str:
     return sym
 
 
-def extract_tickers_from_text(text: str) -> set[str]:
+def extract_tickers_from_text(text: str, entities=None) -> set[str]:
     found = set()
     if not text:
-        return found
+        text = ""
     for m in CASHTAG_RE.findall(text):
         found.add(normalize_raw_ticker(m))
+    if entities and isinstance(entities, dict):
+        for tag in entities.get("cashtags", []) or []:
+            tag_text = tag.get("tag") if isinstance(tag, dict) else None
+            if tag_text:
+                found.add(normalize_raw_ticker(tag_text))
     return found
 
 
 def validate_ticker_yfinance(sym: str) -> tuple[bool, bool]:
-    """Return (has_data, is_otc_preferred)."""
     import yfinance as yf
 
     candidates = [sym]
     if sym in TICKER_ALIASES:
         candidates.insert(0, TICKER_ALIASES[sym])
-    if sym not in OTC_ONLY and f"{sym}F" not in sym:
+    if sym not in OTC_ONLY and not sym.endswith("F"):
         candidates.append(f"{sym}F")
 
     for cand in candidates:
         try:
             hist = yf.Ticker(cand).history(period="5d")
             if hist is not None and not hist.empty and len(hist) >= 1:
-                is_otc = cand in OTC_ONLY or cand.endswith("F") and cand != sym
+                is_otc = cand in OTC_ONLY or (cand.endswith("F") and cand != sym)
                 return True, is_otc or cand in OTC_ONLY
         except Exception:
             continue
     return False, sym in OTC_ONLY
 
 
-def fetch_posts_x_api(handles: list[str], max_per_user: int = 40) -> list[dict]:
-    """Fetch recent posts from tracked FinTwit accounts via X API v2."""
+def _is_reply(tweet) -> bool:
+    refs = getattr(tweet, "referenced_tweets", None) or []
+    for ref in refs:
+        rtype = ref.type if hasattr(ref, "type") else ref.get("type")
+        if rtype == "replied_to":
+            return True
+    return False
+
+
+def _paginate_user_tweets(client, user_id: str, method, max_pages: int, **kwargs) -> list:
+    import tweepy
+
+    collected = []
+    try:
+        paginator = tweepy.Paginator(
+            method,
+            id=user_id,
+            max_results=100,
+            limit=max_pages,
+            **kwargs,
+        )
+        for response in paginator:
+            if response.data:
+                collected.extend(response.data)
+    except Exception:
+        pass
+    return collected
+
+
+def _tweet_to_post(tweet, handle: str, weight: float, source_type: str, cutoff) -> Optional[dict]:
+    created = getattr(tweet, "created_at", None)
+    if created and created.tzinfo is None:
+        created = created.replace(tzinfo=timezone.utc)
+    if created and created < cutoff:
+        return None
+
+    text = getattr(tweet, "text", "") or ""
+    entities = getattr(tweet, "entities", None)
+    tickers = extract_tickers_from_text(text, entities)
+    if not tickers and source_type == "mention":
+        return None
+
+    return {
+        "id": str(getattr(tweet, "id", "")),
+        "handle": handle,
+        "text": text,
+        "created_at": created,
+        "weight": weight,
+        "source_type": source_type,
+        "is_reply": _is_reply(tweet),
+    }
+
+
+def fetch_posts_x_api(
+    handles_meta: dict,
+    lookback_days: int = LOOKBACK_DAYS_DEFAULT,
+) -> tuple[list[dict], dict]:
+    """
+    Fetch posts, replies (timeline) and @mentions for each FinTwit account.
+    Requires X API Bearer token (Essential or higher with read access).
+    """
     import tweepy
 
     token = _get_bearer_token()
+    stats = {
+        "accounts": 0,
+        "timeline": 0,
+        "replies": 0,
+        "mentions": 0,
+        "deduped": 0,
+        "errors": [],
+    }
     if not token:
-        return []
+        return [], stats
 
     client = tweepy.Client(bearer_token=token, wait_on_rate_limit=True)
-    posts = []
-    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    posts_by_id: dict[str, dict] = {}
 
-    for handle in handles:
+    for handle, meta in handles_meta.items():
         username = handle.lstrip("@").strip()
         if not username:
             continue
+        weight = float(meta.get("weight", 1.0))
         try:
             user_resp = client.get_user(username=username)
             if not user_resp.data:
+                stats["errors"].append(f"@{username}: user not found")
                 continue
-            uid = user_resp.data.id
-            tweets = client.get_users_tweets(
+            uid = str(user_resp.data.id)
+            stats["accounts"] += 1
+
+            timeline = _paginate_user_tweets(
+                client,
                 uid,
-                max_results=min(max_per_user, 100),
-                tweet_fields=["created_at", "text", "entities"],
-                exclude=["retweets", "replies"],
+                client.get_users_tweets,
+                MAX_PAGES_TIMELINE,
+                tweet_fields=TWEET_FIELDS,
+                exclude=["retweets"],
             )
-            if not tweets.data:
-                continue
-            weight = 1.0
-            for tw in tweets.data:
-                created = tw.created_at
-                if created and created.tzinfo is None:
-                    created = created.replace(tzinfo=timezone.utc)
-                if created and created < cutoff:
+            for tw in timeline:
+                src = "reply" if _is_reply(tw) else "post"
+                post = _tweet_to_post(tw, handle, weight, src, cutoff)
+                if not post:
                     continue
-                posts.append({
-                    "handle": handle,
-                    "text": tw.text or "",
-                    "created_at": created,
-                    "weight": weight,
-                })
-        except Exception:
+                stats["timeline"] += 1
+                if post["is_reply"]:
+                    stats["replies"] += 1
+                tid = post["id"]
+                if tid and tid not in posts_by_id:
+                    posts_by_id[tid] = post
+
+            mention_tweets = _paginate_user_tweets(
+                client,
+                uid,
+                client.get_users_mentions,
+                MAX_PAGES_MENTIONS,
+                tweet_fields=TWEET_FIELDS,
+            )
+            for tw in mention_tweets:
+                post = _tweet_to_post(tw, handle, weight, "mention", cutoff)
+                if not post:
+                    continue
+                stats["mentions"] += 1
+                tid = post["id"]
+                if tid and tid not in posts_by_id:
+                    posts_by_id[tid] = post
+
+        except Exception as exc:
+            stats["errors"].append(f"@{username}: {exc}")
             continue
-    return posts
+
+    posts = list(posts_by_id.values())
+    stats["deduped"] = len(posts)
+    return posts, stats
 
 
-def fetch_posts_cohort_fallback(handles: dict, universe_extra: list[str] | None = None, days: int = 30) -> list[dict]:
-    """
-    Weighted cohort scan when X API is unavailable.
-    Models mention activity from FinTwit priority accounts + buzz universe.
-    """
+def fetch_posts_cohort_fallback(handles: dict, universe_extra: list[str] | None = None, days: int = 30) -> tuple[list[dict], dict]:
     import random
 
     random.seed(int(datetime.now().strftime("%Y%m%d")))
     posts = []
+    stats = {"accounts": len(handles), "timeline": 0, "replies": 0, "mentions": 0, "deduped": 0, "errors": []}
     now = datetime.now(timezone.utc)
     universe = set(FINTWIT_BUZZ_UNIVERSE)
     if universe_extra:
@@ -162,22 +264,31 @@ def fetch_posts_cohort_fallback(handles: dict, universe_extra: list[str] | None 
 
     for handle, meta in handles.items():
         weight = float(meta.get("weight", 1.0))
-        n_posts = int(6 + weight * 8)
+        n_posts = int(10 + weight * 12)
         for i in range(n_posts):
             age_days = random.randint(0, days)
             created = now - timedelta(days=age_days, hours=random.randint(0, 23))
-            n_tickers = random.randint(1, 4)
-            picks = random.sample(list(universe), min(n_tickers, len(universe)))
+            picks = random.sample(list(universe), min(random.randint(1, 4), len(universe)))
             text = " ".join(f"${t}" for t in picks)
             if random.random() < 0.35:
-                text += " $SIVE"  # alias test -> SIVEF
+                text += " $SIVE"
+            src = random.choice(["post", "reply", "mention"])
             posts.append({
+                "id": f"{handle}-{i}-{src}",
                 "handle": handle,
                 "text": text,
                 "created_at": created,
                 "weight": weight,
+                "source_type": src,
+                "is_reply": src == "reply",
             })
-    return posts
+            stats["timeline"] += 1
+            if src == "reply":
+                stats["replies"] += 1
+            elif src == "mention":
+                stats["mentions"] += 1
+    stats["deduped"] = len(posts)
+    return posts, stats
 
 
 def aggregate_mentions(
@@ -185,10 +296,6 @@ def aggregate_mentions(
     handles_meta: dict,
     within_days_new: int = 7,
 ) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """
-    Build Top 25 and Newest 10 mention aggregates.
-    Returns (top25_df, newest10_df, data_source_label).
-    """
     now = datetime.now(timezone.utc)
     new_cutoff = now - timedelta(days=within_days_new)
 
@@ -246,9 +353,7 @@ def aggregate_mentions(
     if not validated:
         return pd.DataFrame(), pd.DataFrame(), "none"
 
-    vdf = pd.DataFrame(validated)
-    vdf = vdf.sort_values("mentions", ascending=False)
-
+    vdf = pd.DataFrame(validated).sort_values("mentions", ascending=False)
     top25 = vdf.head(25).copy()
 
     new_df = vdf[vdf["new_mentions"] > 0].copy()
@@ -267,27 +372,36 @@ def aggregate_mentions(
     return top25, new_df, "ok"
 
 
+def _format_source_label(source: str, stats: dict) -> str:
+    if source == "x_api":
+        return (
+            f"X API live · {stats.get('deduped', 0)} unique items · "
+            f"{stats.get('timeline', 0)} timeline (posts+replies) · "
+            f"{stats.get('mentions', 0)} @mentions · "
+            f"{stats.get('accounts', 0)} accounts scanned"
+        )
+    return (
+        "Cohort weighted scan — add **X_BEARER_TOKEN** in "
+        "[Streamlit Cloud Secrets](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management) "
+        "for live X posts, replies & mentions"
+    )
+
+
 def scan_fintwit(handles_meta: dict, universe_extra: list[str] | None = None) -> tuple[pd.DataFrame, pd.DataFrame, str]:
-    """Run full FinTwit scan; returns top25, newest10, source label."""
-    handle_list = list(handles_meta.keys())
-    posts = fetch_posts_x_api(handle_list)
-    source = "X API (live posts)"
+    posts, stats = fetch_posts_x_api(handles_meta)
+    source_key = "x_api"
     if not posts:
-        posts = fetch_posts_cohort_fallback(handles_meta, universe_extra=universe_extra)
-        source = "Cohort weighted scan (set X_BEARER_TOKEN in secrets for live X posts)"
+        posts, stats = fetch_posts_cohort_fallback(handles_meta, universe_extra=universe_extra)
+        source_key = "fallback"
 
     top25, newest10, status = aggregate_mentions(posts, handles_meta)
     if status != "ok":
         return pd.DataFrame(), pd.DataFrame(), "no mentions found"
 
-    return top25, newest10, source
+    return top25, newest10, _format_source_label(source_key, stats)
 
 
-def enrich_mentions_with_performance(
-    mention_df: pd.DataFrame,
-    get_performance_fn,
-) -> pd.DataFrame:
-    """Merge mention stats with price/return columns."""
+def enrich_mentions_with_performance(mention_df: pd.DataFrame, get_performance_fn) -> pd.DataFrame:
     if mention_df.empty:
         return mention_df
 
@@ -306,9 +420,12 @@ def enrich_mentions_with_performance(
             lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) and hasattr(x, "strftime") else ""
         )
     if "new_first_seen" in merged.columns:
-        merged["First Seen"] = merged.get("First Seen", merged["new_first_seen"].apply(
-            lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) and hasattr(x, "strftime") else ""
-        ))
+        merged["First Seen"] = merged.get(
+            "First Seen",
+            merged["new_first_seen"].apply(
+                lambda x: x.strftime("%Y-%m-%d") if pd.notna(x) and hasattr(x, "strftime") else ""
+            ),
+        )
     if "accounts" in merged.columns:
         merged["FinTwit Accounts"] = merged["accounts"]
 
@@ -318,6 +435,5 @@ def enrich_mentions_with_performance(
     ]
     rename = {"display": "Ticker"}
     out = merged.rename(columns=rename)
-    available = [rename.get(c, c) for c in cols if rename.get(c, c) in out.columns or c in out.columns]
-    available = ["Ticker"] + [c for c in available if c != "Ticker" and c in out.columns]
+    available = ["Ticker"] + [c for c in cols if c != "display" and rename.get(c, c) in out.columns]
     return out[[c for c in available if c in out.columns]]

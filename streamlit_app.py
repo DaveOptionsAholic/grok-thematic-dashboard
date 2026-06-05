@@ -12,7 +12,7 @@ from datetime import datetime
 import json
 import random
 
-from fintwit_mentions import enrich_mentions_with_performance, scan_fintwit
+from fintwit_mentions import enrich_mentions_with_performance, scan_fintwit, x_api_configured
 
 DASHBOARD_VERSION = "15.2"
 
@@ -663,6 +663,15 @@ with tab2:
         "Scans all priority FinTwit accounts on X for cashtags ($TICKER). "
         "OTC aliases resolved (e.g. **$SIVE → $SIVEF**). US + OTC markets."
     )
+
+    if x_api_configured():
+        st.success("X API connected — scanning posts, replies, and @mentions (paginated).")
+    else:
+        st.warning(
+            "X API not configured. Add **X_BEARER_TOKEN** in "
+            "[Streamlit Cloud Secrets](https://docs.streamlit.io/deploy/streamlit-community-cloud/deploy-your-app/secrets-management) "
+            "then reboot the app."
+        )
 
     scan_col1, scan_col2 = st.columns([3, 1])
     with scan_col1:
