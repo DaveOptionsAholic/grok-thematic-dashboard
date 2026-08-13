@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
 Grok Build v15.2 - Thematic Portfolios Dashboard
-- Hardcoded expanded FinTwit accounts (58) with equal 1.0x weighting
-- Reliable on Streamlit Cloud (no CSV dependency)
+- Hardcoded 58 FinTwit accounts (equal 1.0x weighting)
+- Full sidebar controls restored
+- Reliable on Streamlit Cloud
 """
 
 import streamlit as st
@@ -19,11 +20,8 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("7 Thematic Portfolios")
-
 # ============================================================
 # FINTWIT ACCOUNTS (58 accounts - equal 1.0x weighting)
-# Hardcoded for reliable Streamlit Cloud deployment
 # ============================================================
 FINTWIT_ACCOUNTS = {
     "@aleabitoreddit": {"field": "Photonics", "weight": 1.0},
@@ -159,16 +157,9 @@ def deduplicate_and_aggregate(df):
     if df.empty:
         return df
     agg_dict = {
-        "Price": "last",
-        "1D%": "last",
-        "1W%": "last",
-        "2W%": "last",
-        "1M%": "last",
-        "3M%": "last",
-        "YTD%": "last",
-        "1Y%": "last",
-        "Mentions": "sum",
-        "Weighted_Score": "mean",
+        "Price": "last", "1D%": "last", "1W%": "last", "2W%": "last",
+        "1M%": "last", "3M%": "last", "YTD%": "last", "1Y%": "last",
+        "Mentions": "sum", "Weighted_Score": "mean",
     }
     return df.groupby("Ticker", as_index=False).agg(agg_dict)
 
@@ -176,13 +167,8 @@ def show_table(df, sort_by=None, ascending=False):
     if df.empty:
         return
     rename_map = {
-        "1D%": "1 Day %",
-        "1W%": "1 Week Return %",
-        "2W%": "2 Week Return %",
-        "1M%": "1 Month %",
-        "3M%": "3 Month %",
-        "YTD%": "YTD %",
-        "1Y%": "1 Year %",
+        "1D%": "1 Day %", "1W%": "1 Week Return %", "2W%": "2 Week Return %",
+        "1M%": "1 Month %", "3M%": "3 Month %", "YTD%": "YTD %", "1Y%": "1 Year %",
         "Weighted_Score": "Weighted Score",
     }
     display_df = df.rename(columns=rename_map)
@@ -218,6 +204,53 @@ def show_table(df, sort_by=None, ascending=False):
     )
 
 # ============================================================
+# SIDEBAR CONTROLS (restored from V15.2)
+# ============================================================
+with st.sidebar:
+    st.success("Dashboard v15.2")
+    st.markdown("### ⚙️ Controls")
+
+    if st.button("🔄 Refresh All Stock Data", type="primary", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+
+    st.markdown("---")
+    st.markdown("**Stocks loaded**")
+    stocks_placeholder = st.empty()
+
+    st.markdown("---")
+    st.markdown("### Tables")
+    leaderboard_theme = st.selectbox(
+        "Leaderboard theme",
+        ["All Themes"] + list(THEMES.keys()),
+        index=0
+    )
+    default_sort = st.selectbox(
+        "Default table sort",
+        ["Weighted_Score", "1W%", "2W%", "1M%", "YTD%", "Mentions", "Price"],
+        index=0
+    )
+    sort_ascending = st.checkbox("Sort ascending", value=False)
+
+    st.markdown("---")
+    st.markdown("### Charts — Global")
+    primary_metric = st.selectbox(
+        "Primary metric",
+        ["1W%", "2W%", "1M%", "YTD%", "Weighted_Score", "Mentions"],
+        index=0
+    )
+    chart_theme_filter = st.selectbox(
+        "Chart theme filter",
+        ["All Themes"] + list(THEMES.keys()),
+        index=0
+    )
+    style_template = st.selectbox(
+        "Style template",
+        ["plotly_dark", "plotly_white", "plotly", "ggplot2", "seaborn"],
+        index=0
+    )
+
+# ============================================================
 # LOAD DATA
 # ============================================================
 all_tickers = []
@@ -232,11 +265,9 @@ if not perf_df.empty:
     perf_df["Mentions"] = [random.randint(180, 2200) for _ in range(len(perf_df))]
     perf_df["Mentions_norm"] = perf_df["Mentions"] / perf_df["Mentions"].max()
 
-    # Simple FinTwit boost (equal weights now)
     fintwit_boost_map = {}
     for t in perf_df["Ticker"]:
         boost = 0.0
-        # Light boost for names that appear frequently in FinTwit
         if any(s in t for s in ["NVDA", "ASTS", "RKLB", "MU", "IONQ", "LITE", "COHR", "SIVEF", "TSLA"]):
             boost = 0.25
         fintwit_boost_map[t] = boost
@@ -255,20 +286,25 @@ if not perf_df.empty:
 
     perf_df["Theme"] = perf_df["Ticker"].apply(get_theme)
 
-# ============================================================
-# REFRESH + STATUS
-# ============================================================
-st.markdown("---")
-col1, col2 = st.columns([1, 3])
-with col1:
-    if st.button("🔄 Refresh All Stock Data", type="primary"):
-        st.cache_data.clear()
-        st.rerun()
-with col2:
-    if perf_df.empty:
-        st.error("⚠️ No stock data loaded. Try clicking Refresh above.")
+# Update sidebar stock count
+with stocks_placeholder.container():
+    if not perf_df.empty:
+        st.metric(label="", value=len(perf_df))
+        st.caption(f"Updated: {last_updated}")
     else:
-        st.success(f"✅ Loaded data for **{len(perf_df)}** stocks  •  Last updated: {last_updated}")
+        st.metric(label="", value=0)
+        st.caption("No data")
+
+# ============================================================
+# MAIN TITLE + STATUS
+# ============================================================
+st.title("7 Thematic Portfolios")
+st.caption(f"Build v15.2  •  Sidebar chart controls  •  {len(FINTWIT_ACCOUNTS)} FinTwit accounts")
+
+if not perf_df.empty:
+    st.success(f"✅ Loaded data for **{len(perf_df)}** stocks  •  Last updated: {last_updated}")
+else:
+    st.error("⚠️ No stock data loaded. Click **Refresh All Stock Data** in the sidebar.")
 
 # ============================================================
 # TABS
@@ -287,13 +323,17 @@ with tab1:
     st.caption(f"Last updated: {last_updated}")
 
     if not perf_df.empty:
-        for theme, tickers in THEMES.items():
+        themes_to_show = THEMES.items()
+        if leaderboard_theme != "All Themes":
+            themes_to_show = [(leaderboard_theme, THEMES[leaderboard_theme])]
+
+        for theme, tickers in themes_to_show:
             theme_df = perf_df[perf_df["Ticker"].isin(tickers)].copy()
             if theme_df.empty:
                 continue
             theme_df = deduplicate_and_aggregate(theme_df)
             st.markdown(f"### {theme}")
-            show_table(theme_df, sort_by="Weighted_Score", ascending=False)
+            show_table(theme_df, sort_by=default_sort, ascending=sort_ascending)
 
     st.markdown("---")
     st.subheader("Exchange-Traded Funds (ETFs)")
@@ -303,7 +343,7 @@ with tab1:
     if not etf_perf.empty:
         etf_perf["Mentions"] = [random.randint(500, 4500) for _ in range(len(etf_perf))]
         etf_perf["Weighted_Score"] = etf_perf["Mentions"] / 50
-        show_table(etf_perf, sort_by="Weighted_Score", ascending=False)
+        show_table(etf_perf, sort_by=default_sort, ascending=sort_ascending)
     else:
         st.info("ETF data temporarily unavailable.")
 
@@ -321,12 +361,13 @@ with tab2:
     else:
         st.info("No OTC tickers configured.")
 
-# Tab 3 - FinTwit Accounts (now expanded)
+# Tab 3
 with tab3:
     st.subheader("FinTwit Accounts — Priority Cohort")
     st.caption(f"Last updated: {last_updated}")
     st.success(f"**{len(FINTWIT_ACCOUNTS)} accounts** loaded with equal **1.0x** weighting.")
     st.info("These accounts are scanned first and receive elevated weighting for stock mentions.")
+    st.info("📌 **$SIVEF** has received significant recent attention.")
 
     if "fintwit_last_refresh" not in st.session_state:
         st.session_state.fintwit_last_refresh = "Never"
@@ -340,17 +381,11 @@ with tab3:
             st.toast("FinTwit activity refreshed", icon="✅")
             st.rerun()
 
-    # Display the full expanded list
     spec_display = pd.DataFrame([
-        {
-            "Handle": h,
-            "Field": meta["field"],
-            "Weight": f"{meta['weight']}x",
-        }
+        {"Handle": h, "Field": meta["field"], "Weight": f"{meta['weight']}x"}
         for h, meta in sorted(FINTWIT_ACCOUNTS.items(), key=lambda x: x[0].lower())
     ])
     st.dataframe(spec_display, width="stretch", hide_index=True)
-
     st.caption(f"Hardcoded list  •  {len(FINTWIT_ACCOUNTS)} total accounts  •  All weighted 1.0x")
 
 # Tab 4
@@ -366,96 +401,70 @@ with tab4:
     else:
         st.info("No data available yet.")
 
-# Tab 5 - Charts
+# Tab 5
 with tab5:
     st.subheader("📊 Visual Analytics")
     st.caption(f"Last updated: {last_updated}")
 
     if not perf_df.empty:
-        # Pie
-        theme_avg = perf_df.groupby("Theme")["1W%"].mean().reset_index()
+        chart_df = perf_df.copy()
+        if chart_theme_filter != "All Themes":
+            chart_df = chart_df[chart_df["Theme"] == chart_theme_filter]
+
+        theme_avg = chart_df.groupby("Theme")[primary_metric].mean().reset_index()
         fig_pie = go.Figure(data=[go.Pie(
             labels=theme_avg["Theme"],
-            values=theme_avg["1W%"],
+            values=theme_avg[primary_metric],
             textinfo="label+percent",
         )])
-        fig_pie.update_layout(title="Average 1 Week Return % by Theme", height=420, template="plotly_dark")
+        fig_pie.update_layout(title=f"Average {primary_metric} by Theme", height=420, template=style_template)
         st.plotly_chart(fig_pie, width="stretch")
 
-        # Scatter
         fig_scatter = px.scatter(
-            perf_df,
-            x="Mentions",
-            y="Weighted_Score",
-            color="Theme",
-            size=perf_df["1W%"].abs() + 2,
-            hover_name="Ticker",
-            marginal_x="box",
-            marginal_y="violin",
+            chart_df, x="Mentions", y="Weighted_Score", color="Theme",
+            size=chart_df["1W%"].abs() + 2, hover_name="Ticker",
+            marginal_x="box", marginal_y="violin",
             title="Mentions vs Weighted Score (Size = |1 Week Return %|)",
-            template="plotly_dark",
-            height=550,
+            template=style_template, height=550,
         )
         st.plotly_chart(fig_scatter, width="stretch")
 
-        # Treemap
         st.markdown("### Top 25 Performers")
-        st.caption("Based on 1 Week Return %")
-        top_performers = perf_df.nlargest(25, "1W%")
+        st.caption(f"Based on {primary_metric}")
+        top_performers = chart_df.nlargest(25, primary_metric)
         fig_treemap = px.treemap(
-            top_performers,
-            path=["Theme", "Ticker"],
-            values="1W%",
-            color="Weighted_Score",
-            color_continuous_scale="RdYlGn",
-            title="Top 25 Performers by 1 Week Return %",
+            top_performers, path=["Theme", "Ticker"], values=primary_metric,
+            color="Weighted_Score", color_continuous_scale="RdYlGn",
+            title=f"Top 25 Performers by {primary_metric}",
         )
-        fig_treemap.update_layout(height=500, template="plotly_dark")
+        fig_treemap.update_layout(height=500, template=style_template)
         st.plotly_chart(fig_treemap, width="stretch")
 
-        # Polar (ETFs)
         if not etf_perf.empty:
             st.markdown("### ETF Performance (Polar View)")
             st.caption("Top ETFs by 1 Week Return %")
             top_etfs = etf_perf.nlargest(12, "1W%").copy()
             fig_polar = go.Figure()
             fig_polar.add_trace(go.Barpolar(
-                r=top_etfs["1W%"],
-                theta=top_etfs["Ticker"],
-                width=0.65,
-                marker_color=top_etfs["Weighted_Score"],
-                marker_colorscale="Turbo",
-                marker_line_color="#333333",
-                marker_line_width=1,
-                opacity=0.9,
-                hovertemplate=(
-                    "<b>%{theta}</b><br>"
-                    "1D%: %{customdata[0]:.2f}%<br>"
-                    "1W%: %{r:.2f}%<br>"
-                    "2W%: %{customdata[1]:.2f}%<br>"
-                    "Weighted Score: %{marker.color:.1f}<extra></extra>"
-                ),
+                r=top_etfs["1W%"], theta=top_etfs["Ticker"], width=0.65,
+                marker_color=top_etfs["Weighted_Score"], marker_colorscale="Turbo",
+                marker_line_color="#333333", marker_line_width=1, opacity=0.9,
+                hovertemplate="<b>%{theta}</b><br>1D%: %{customdata[0]:.2f}%<br>1W%: %{r:.2f}%<br>2W%: %{customdata[1]:.2f}%<br>Weighted Score: %{marker.color:.1f}<extra></extra>",
                 customdata=top_etfs[["1D%", "2W%"]].values,
             ))
             fig_polar.update_layout(
-                title="Top ETFs by 1 Week Return % (Polar)",
-                template="plotly_white",
+                title="Top ETFs by 1 Week Return % (Polar)", template="plotly_white",
                 polar=dict(
-                    radialaxis=dict(
-                        visible=True,
-                        showticklabels=False,
-                        range=[min(top_etfs["1W%"]) - 2, max(top_etfs["1W%"]) + 2],
-                        ticksuffix="%",
-                    ),
+                    radialaxis=dict(visible=True, showticklabels=False,
+                                    range=[min(top_etfs["1W%"]) - 2, max(top_etfs["1W%"]) + 2]),
                     angularaxis=dict(direction="clockwise"),
                 ),
-                height=580,
-                font=dict(color="#222222"),
+                height=580, font=dict(color="#222222"),
             )
             st.plotly_chart(fig_polar, width="stretch")
     else:
         st.info("No data available for charts.")
 
 st.caption(
-    f"Grok Build v15  •  7 Thematic Portfolios  •  {len(FINTWIT_ACCOUNTS)} FinTwit Accounts (1.0x equal weight)  •  2 Week Return %"
+    f"Grok Build v15.2  •  7 Thematic Portfolios  •  {len(FINTWIT_ACCOUNTS)} FinTwit Accounts (1.0x)  •  Sidebar Controls Restored"
 )
