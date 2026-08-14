@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Grok Build v15.3 - Thematic Portfolios Dashboard
+Grok Build v15.3b - Thematic Portfolios Dashboard (Arrow-safe tables)
 - FinTwit-discovered unique tickers (top ~88 from 30-day scan)
 - Consolidated single listing (no duplicate tickers)
 - 58 FinTwit accounts (equal 1.0x weighting)
@@ -291,70 +291,64 @@ def get_performance(tickers):
     return pd.DataFrame(records)
 
 def show_table(df, sort_by=None, ascending=False, extra_cols=None):
+    """Arrow-safe table: only float64/int64/str columns, no mixed objects."""
     if df is None or df.empty:
         return
+
     rename_map = {
         "1D%": "1 Day %", "1W%": "1 Week Return %", "2W%": "2 Week Return %",
         "1M%": "1 Month %", "3M%": "3 Month %", "YTD%": "YTD %", "1Y%": "1 Year %",
         "Weighted_Score": "Weighted Score", "Mentions_Score": "Mentions Score",
         "Primary_Theme": "Theme", "FinTwit_Sources": "FinTwit Sources",
     }
-    display_df = df.copy().rename(columns=rename_map)
-    desired_cols = [
+
+    work = df.copy()
+    for c in ("Mentions_norm", "Fintwit_Boost", "is_otc", "Scan_Window"):
+        if c in work.columns:
+            work = work.drop(columns=[c])
+
+    work = work.rename(columns=rename_map)
+
+    desired = [
         "Ticker", "Price", "1 Day %", "1 Week Return %", "2 Week Return %",
         "1 Month %", "3 Month %", "YTD %", "1 Year %", "Mentions", "Mentions Score",
-        "Weighted Score", "Theme", "FinTwit Sources"
+        "Weighted Score", "Theme", "FinTwit Sources",
     ]
     if extra_cols:
-        desired_cols.extend(extra_cols)
-    available_cols = [c for c in desired_cols if c in display_df.columns]
-    display_df = display_df[available_cols].copy()
+        desired.extend(extra_cols)
+    work = work[[c for c in desired if c in work.columns]].copy()
 
-    # Coerce numeric columns so Streamlit column_config never sees bad dtypes
-    numeric_cols = [
+    float_cols = [
         "Price", "1 Day %", "1 Week Return %", "2 Week Return %",
-        "1 Month %", "3 Month %", "YTD %", "1 Year %",
-        "Mentions", "Mentions Score", "Weighted Score",
+        "1 Month %", "3 Month %", "YTD %", "1 Year %", "Weighted Score",
     ]
-    for col in numeric_cols:
-        if col in display_df.columns:
-            display_df[col] = pd.to_numeric(display_df[col], errors="coerce").fillna(0)
+    int_cols = ["Mentions", "Mentions Score"]
+    str_cols = ["Ticker", "Theme", "FinTwit Sources"]
+
+    for col in float_cols:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0).astype("float64")
+    for col in int_cols:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0).round(0).astype("int64")
+    for col in str_cols:
+        if col in work.columns:
+            work[col] = work[col].fillna("").astype(str)
+
+    # Any leftover object cols -> string
+    for col in list(work.columns):
+        if str(work[col].dtype) == "object":
+            work[col] = work[col].astype(str)
+
+    work = work.reset_index(drop=True)
 
     if sort_by:
         sort_col = rename_map.get(sort_by, sort_by)
-        if sort_col in display_df.columns:
-            display_df = display_df.sort_values(sort_col, ascending=ascending)
+        if sort_col in work.columns:
+            work = work.sort_values(sort_col, ascending=ascending).reset_index(drop=True)
 
-    # Simple, compatible column_config (avoid width ints + %% format issues)
-    col_config = {}
-    if "Ticker" in display_df.columns:
-        col_config["Ticker"] = st.column_config.TextColumn("Ticker")
-    if "Price" in display_df.columns:
-        col_config["Price"] = st.column_config.NumberColumn("Price", format="%.2f")
-    for pct_col in ["1 Day %", "1 Week Return %", "2 Week Return %", "1 Month %", "3 Month %", "YTD %", "1 Year %"]:
-        if pct_col in display_df.columns:
-            col_config[pct_col] = st.column_config.NumberColumn(pct_col, format="%.2f")
-    if "Mentions" in display_df.columns:
-        col_config["Mentions"] = st.column_config.NumberColumn("Mentions", format="%d")
-    if "Mentions Score" in display_df.columns:
-        col_config["Mentions Score"] = st.column_config.NumberColumn("Mentions Score", format="%d")
-    if "Weighted Score" in display_df.columns:
-        col_config["Weighted Score"] = st.column_config.NumberColumn("Weighted Score", format="%.1f")
-    if "Theme" in display_df.columns:
-        col_config["Theme"] = st.column_config.TextColumn("Theme")
-    if "FinTwit Sources" in display_df.columns:
-        col_config["FinTwit Sources"] = st.column_config.TextColumn("FinTwit Sources")
-
-    try:
-        st.dataframe(
-            display_df,
-            use_container_width=True,
-            hide_index=True,
-            column_config=col_config if col_config else None,
-        )
-    except Exception:
-        # Ultimate fallback — plain table, no column_config
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    # No column_config — pure Arrow-safe dataframe
+    st.dataframe(work, use_container_width=True, hide_index=True)
 
 # ============================================================
 # SIDEBAR
@@ -438,10 +432,18 @@ if not perf_df.empty:
     perf_df["Weighted_Score"] = perf_df.apply(
         lambda r: calculate_weighted_score(r, r["Fintwit_Boost"], r["is_otc"]), axis=1
     )
+    # Single Theme column only (duplicate Theme names break Arrow/Streamlit)
     if "Primary_Theme" in perf_df.columns:
-        perf_df["Theme"] = perf_df["Primary_Theme"].fillna("Other")
-    else:
+        perf_df["Theme"] = perf_df["Primary_Theme"].fillna("Other").astype(str)
+        perf_df = perf_df.drop(columns=["Primary_Theme"])
+    elif "Theme" not in perf_df.columns:
         perf_df["Theme"] = "Other"
+    else:
+        perf_df["Theme"] = perf_df["Theme"].fillna("Other").astype(str)
+
+    # Ensure FinTwit_Sources is plain string
+    if "FinTwit_Sources" in perf_df.columns:
+        perf_df["FinTwit_Sources"] = perf_df["FinTwit_Sources"].fillna("").astype(str)
 
 # Sidebar stock count
 with stocks_placeholder.container():
